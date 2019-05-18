@@ -1,0 +1,2097 @@
+---
+title: "Cancer Microbiome anti-PD1 Therapy PFAM CCLasso Network Analysis"
+output:
+  html_document:
+    highlight: zenburn
+    theme: cosmo
+  pdf_document:
+    highlight: zenburn
+  html_notebook:
+    df_print: kable
+    highlight: zenburn
+    theme: cosmo
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include = FALSE, cache = FALSE}
+options(max.print = 200)
+options(tinytex.verbose = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  fig.show = "hold",
+  tidy = FALSE,
+  tidy.opts = list(width.cutoff = 80),
+  linewidth = 80
+)
+hook_output = knitr::knit_hooks$get("output")
+knitr::knit_hooks$set(
+  output = function(x, options) {
+    # this hook is used only when the linewidth option is not NULL
+    if (!is.null(n <- options$linewidth)) {
+      x = knitr:::split_lines(x)
+      # any lines wider than n should be wrapped
+      if (any(nchar(x) > n))
+        x = strwrap(x, width = n)
+      x = paste(x, collapse = "\n")
+    }
+    hook_output(x, options)
+  }
+)
+```
+
+```{r}
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(source("CCLasso.R"))
+
+set.seed(19825791)
+
+# coefficient of variation
+co.var <- function(x, na.rm = TRUE) {
+  100 * (sd(x, na.rm = na.rm) / mean(x, na.rm = na.rm))
+}
+
+# kjhealy/polar-labels.r on github:
+# https://gist.github.com/kjhealy/834774#file-polar-labels-r
+radian.rescale <- function(x,
+                           start = 0,
+                           direction = 1) {
+  c.rotate <- function(x) (x + start) %% (2 * pi) * direction
+  c.rotate(scales::rescale(x, c(0, 2 * pi), range(x)))
+}
+
+merge.easy <- function(df1, df2, key) {
+  df1 <- data.table(df1, key = key)
+  df2 <- data.table(df2, key = key)
+  return(as.data.frame(unique(
+    merge(
+      df1,
+      df2,
+      all.x = TRUE,
+      by = .EACHI,
+      allow.cartesian = TRUE
+    )
+  ), stringsAsFactors = FALSE))
+}
+
+# quartile coefficient of dispersion
+qcd <- function(x) {
+  (quantile(x, 0.75) - quantile(x, 0.25)) /
+  (quantile(x, 0.75) + quantile(x, 0.25))
+}
+
+plot_network <- function(ig, coord = layout_with_fr(ig), ...) {
+  plot(
+    ig,
+    layout = coord,
+    vertex.size = 2,
+    vertex.label = V(ig)$name,
+    vertex.label.dist = 1,
+    vertex.label.cex = 0.25,
+    vertex.label.degree = radian.rescale(
+      x = 1:vcount(ig),
+      direction = -1,
+      start = 0
+    ),
+    edge.color = ifelse(E(ig)$weight > 0, 'green', 'red'),
+    ...
+  )
+}
+```
+
+### Load Data and Metadata
+
+```{r}
+pfam_data <-
+  read.delim("data/yams_pd1_pub_pfam_ppm.txt", stringsAsFactors = FALSE)
+rownames(pfam_data) <- pfam_data$Feature
+pfam_data$Feature <- NULL
+pfam_data <- as.data.frame(t(pfam_data), stringsAsFactors = FALSE)
+# remove features with fewer than 10 observations
+pfam_data <- pfam_data[, colSums(pfam_data != 0) > 10]
+pfam_feat <-
+  read.delim("data/yams_pd1_pub_pfam_feat.txt", stringsAsFactors = FALSE)
+patient_meta <-
+  read.delim("data/yams_pd1_pub_meta.txt", stringsAsFactors = FALSE)
+patient_meta$ResponseBinary <-
+  as.numeric(factor((patient_meta$Clin_Response))) - 1
+patient_meta <- patient_meta[, c("Sample", "ResponseBinary")]
+patient_meta$Sample <- gsub("-", ".", patient_meta$Sample)
+```
+
+### Variance and Coefficient of Variation Summary Statistics
+
+```{r}
+summary(lm(log(apply(pfam_data, 2, var)) ~ log(apply(
+  pfam_data, 2, mean, na.rm = TRUE
+))))
+summary(lm(log(apply(pfam_data, 2, co.var)) ~ log(apply(
+  pfam_data, 2, mean, na.rm = TRUE
+))))
+```
+```{r, fig.height=4.5, fig.width=10}
+par(mfrow = c(1, 2), mar = c(5.1, 4.1, 4.1, 2.1))
+plot(
+  apply(pfam_data, 2, mean, na.rm = TRUE),
+  apply(pfam_data, 2, var),
+  log = "xy",
+  xlab = "Mean",
+  ylab = "Variance"
+)
+plot(
+  apply(pfam_data, 2, mean, na.rm = TRUE),
+  apply(pfam_data, 2, co.var),
+  log = "xy",
+  xlab = "Mean",
+  ylab = "Coefficient of Variation"
+)
+```
+```{r, fig.height=4.5, fig.width=10}
+par(mfrow = c(1, 2), mar = c(5.1, 4.1, 4.1, 2.1))
+# hist(apply(pfam_data, 2, mean, na.rm = TRUE))
+hist(
+  apply(pfam_data, 2, co.var),
+  breaks = 100,
+  xlab = "Coefficient of Variation",
+  main = "Coefficient of Variation Histogram"
+)
+plot(density(apply(pfam_data, 2, co.var)),
+     main = "Coefficient of Variation Density")
+abline(v = 200, col = "red")
+```
+
+#### Remove features with low coefficient of variation:
+
+```{r}
+pfam_data <- pfam_data[, apply(pfam_data, 2, co.var) > 200]
+```
+
+```{r}
+ggplot(data.frame(
+  Mean = apply(pfam_data, 2, mean, na.rm = TRUE),
+  CoefVar = apply(pfam_data, 2, co.var)
+), aes(x = Mean, y = CoefVar)) +
+  geom_point(alpha = 0.2) +
+  geom_density2d() +
+  scale_x_log10() +
+  scale_y_log10(limits = c(180, 1100))
+```
+
+### Build Network
+
+```{r}
+# CCLasso takes many hours to run (load cached if available)
+ccl_pfam_file <- "data/ccl_pfam_cv200.Rda"
+if (!file.exists(ccl_pfam_file)) {
+  ccl_pfam <- cclasso(as.matrix(pfam_data), counts = TRUE)
+  save(ccl_pfam, file = ccl_pfam_file)
+} else {
+  load(ccl_pfam_file)
+}
+ccl_pfam$cor_w[is.nan(ccl_pfam$cor_w)] <- 0
+ccl_pfam_pvals_vec <- ccl_pfam$p_vals[upper.tri(ccl_pfam$p_vals)]
+ccl_pfam_pvals_adj <- p.adjust(ccl_pfam_pvals_vec, "BH")
+ccl_pfam_edges <- ccl_pfam$cor_w[upper.tri(ccl_pfam$cor_w)]
+# p-value < 1e-4 otherwise CCLasso network number of edges is very large
+ccl_pfam_edges[ccl_pfam_pvals_adj > 1e-4] <- 0
+ccl_pfam_amat <- matrix(0, dim(pfam_data)[2], dim(pfam_data)[2])
+rownames(ccl_pfam_amat) <- colnames(pfam_data)
+colnames(ccl_pfam_amat) <- colnames(pfam_data)
+ccl_pfam_amat[upper.tri(ccl_pfam_amat)] <- ccl_pfam_edges
+ccl_pfam_g <- graph_from_adjacency_matrix(
+  ccl_pfam_amat,
+  mode = "upper",
+  weighted = TRUE,
+  diag = FALSE
+)
+ccl_pfam_g <- induced_subgraph(
+  ccl_pfam_g,
+  V(ccl_pfam_g)[
+    components(ccl_pfam_g)$membership ==
+    which.max(components(ccl_pfam_g)$csize)
+  ]
+)
+ccl_pfam_p_g <- delete_edges(
+  ccl_pfam_g,
+  E(ccl_pfam_g)[E(ccl_pfam_g)$weight < 0]
+)
+ccl_pfam_p_g <- induced_subgraph(
+  ccl_pfam_p_g,
+  V(ccl_pfam_p_g)[
+    components(ccl_pfam_p_g)$membership ==
+    which.max(components(ccl_pfam_p_g)$csize)
+  ]
+)
+ccl_pfam_p_g_v_msk <- (
+  V(ccl_pfam_g)$name %in% V(ccl_pfam_p_g)$name
+)
+ccl_pfam_n_g <- delete_edges(
+  ccl_pfam_g,
+  E(ccl_pfam_g)[E(ccl_pfam_g)$weight > 0]
+)
+ccl_pfam_n_g <- induced_subgraph(
+  ccl_pfam_n_g,
+  V(ccl_pfam_n_g)[
+    components(ccl_pfam_n_g)$membership ==
+    which.max(components(ccl_pfam_n_g)$csize)
+  ]
+)
+ccl_pfam_n_g_v_msk <- (
+  V(ccl_pfam_g)$name %in% V(ccl_pfam_n_g)$name
+)
+```
+
+### Visualize Network
+
+```{r, fig.height=4.5, fig.width=10}
+ccl_pfam_g_coord <- layout_with_lgl(ccl_pfam_g)
+ccl_pfam_p_g_coord <- ccl_pfam_g_coord[ccl_pfam_p_g_v_msk, , drop = F]
+ccl_pfam_n_g_coord <- ccl_pfam_g_coord[ccl_pfam_n_g_v_msk, , drop = F]
+par(mfrow = c(1, 3), mar = c(1, 1, 3, 1))
+plot_network(ccl_pfam_g,
+             coord = ccl_pfam_g_coord,
+             main = "PFAM CCLasso Network")
+plot_network(ccl_pfam_p_g,
+             coord = ccl_pfam_p_g_coord,
+             main = "+ Interactions")
+plot_network(ccl_pfam_n_g,
+             coord = ccl_pfam_n_g_coord,
+             main = "- Interactions")
+```
+
+```{r, include = FALSE}
+png(
+  "results/Pfam_CCLassoNet.png",
+  height = 4.5,
+  width = 10,
+  units = "in",
+  res = 300
+)
+par(mfrow = c(1, 3), mar = c(1, 1, 3, 1))
+plot_network(ccl_pfam_g,
+             coord = ccl_pfam_g_coord,
+             main = "PFAM CCLasso Network")
+plot_network(ccl_pfam_p_g,
+             coord = ccl_pfam_p_g_coord,
+             main = "+ Interactions")
+plot_network(ccl_pfam_n_g,
+             coord = ccl_pfam_n_g_coord,
+             main = "- Interactions")
+invisible(dev.off())
+```
+
+### Network Statistics
+
+#### Degree distribution, shortest paths distance distribution, transitivity:
+
+```{r, fig.height=9, fig.width=10}
+par(mfrow = c(2, 2), mar = c(5.1, 4.1, 4.1, 2.1))
+# degree distribution
+k <- degree(ccl_pfam_g)
+hist(k,
+     breaks = 100,
+     xlab = "k",
+     ylab = "Frequency",
+     main = "Degree Histogram")
+dd <- degree_distribution(ccl_pfam_g)
+dd_nzero_pos <- which(dd != 0)
+pk <- dd[dd_nzero_pos]
+dx <- 1:max(k)
+dx <- dx[dd_nzero_pos]
+plot(
+  pk ~ log(dx),
+  log = "xy",
+  xlab = "log k",
+  ylab = "log Pk",
+  main = "Log-Log Degree Distribution"
+)
+# distance distribution of shortest paths
+nv <- vcount(ccl_pfam_g)
+bfs_vec <- matrix(nrow = nv, ncol = nv)
+for (i in 1:nv) {
+  bfs_vec[i, ] <- bfs(
+    ccl_pfam_g,
+    root = i,
+    dist = TRUE,
+    unreachable = FALSE
+  )$dist
+}
+distd <- table(bfs_vec) / sum(bfs_vec, na.rm = TRUE)
+distd <- tail(distd, length(distd) - 1)
+plot(
+  names(distd),
+  distd,
+  xlab = "Distance",
+  ylab = expression(P[Distance]),
+  main = "Distance Distribution of Shortest Paths"
+)
+# clustering
+cl <- transitivity(ccl_pfam_g, type = "local")
+cl_df <- data.frame(clust = cl, degree = k) %>%
+  group_by(degree) %>%
+  summarize(mclust = mean(clust, na.rm = TRUE))
+plot(
+  mclust ~ degree,
+  data = cl_df,
+  xlab = "k",
+  ylab = "C(k)",
+  main = "Clustering Coefficent"
+)
+```
+```{r, include = FALSE}
+png(
+  "results/Pfam_CCLassoNet_Stats.png",
+  height = 9,
+  width = 10,
+  units = "in",
+  res = 300
+)
+par(mfrow = c(2, 2), mar = c(5.1, 4.1, 4.1, 2.1))
+hist(k,
+     breaks = 100,
+     xlab = "k",
+     ylab = "Frequency",
+     main = "Degree Histogram")
+plot(
+  pk ~ log(dx),
+  log = "xy",
+  xlab = "log k",
+  ylab = "log Pk",
+  main = "Log-Log Degree Distribution"
+)
+plot(
+  names(distd),
+  distd,
+  xlab = "Distance",
+  ylab = expression(P[Distance]),
+  main = "Distance Distribution of Shortest Paths"
+)
+plot(
+  mclust ~ degree,
+  data = cl_df,
+  xlab = "k",
+  ylab = "C(k)",
+  main = "Clustering Coefficent"
+)
+invisible(dev.off())
+```
+
+#### Additional statistics:
+
+```{r}
+data.frame(
+  "Clustering coef." = transitivity(ccl_pfam_g, type = "global"),
+  "Power law coef." = fit_power_law(k, xmin = 1)$alpha,
+  "Mean shortest path" = mean(bfs_vec, na.rm = TRUE),
+  "Density" = edge_density(ccl_pfam_g)
+)
+```
+
+### Community Detection in Networks Using InfoMap and SpinGlass
+
+```{r, fig.height=13.5, fig.width=10}
+num_top_clusts <- 3
+
+# InfoMap +Network
+ccl_pfam_p_g_imap <- cluster_infomap(ccl_pfam_p_g)
+ccl_pfam_p_g_imap_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_p_g_imap), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_p_g_imap_top_v_msk <- (
+  ccl_pfam_p_g_imap$membership %in% ccl_pfam_p_g_imap_top_ids
+)
+ccl_pfam_p_g_imap_top_g <- induced_subgraph(
+  ccl_pfam_p_g,
+  V(ccl_pfam_p_g)[ccl_pfam_p_g_imap_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_p_g_imap_top <- ccl_pfam_p_g_imap
+ccl_pfam_p_g_imap_top$names <-
+  ccl_pfam_p_g_imap_top$names[ccl_pfam_p_g_imap_top_v_msk]
+ccl_pfam_p_g_imap_top$membership <-
+  ccl_pfam_p_g_imap_top$membership[ccl_pfam_p_g_imap_top_v_msk]
+ccl_pfam_p_g_imap_top$vcount <- length(ccl_pfam_p_g_imap_top$names)
+
+# SpinGlass +Network
+# SpinGlass takes a long time to run (load cached if available)
+ccl_pfam_p_g_spin_file <- "data/ccl_pfam_p_g_spin.Rda"
+if (!file.exists(ccl_pfam_p_g_spin_file)) {
+  ccl_pfam_p_g_spin <- cluster_spinglass(ccl_pfam_p_g)
+  save(ccl_pfam_p_g_spin, file = ccl_pfam_p_g_spin_file)
+} else {
+  load(ccl_pfam_p_g_spin_file)
+}
+ccl_pfam_p_g_spin_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_p_g_spin), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_p_g_spin_top_v_msk <- (
+  ccl_pfam_p_g_spin$membership %in% ccl_pfam_p_g_spin_top_ids
+)
+ccl_pfam_p_g_spin_top_g <- induced_subgraph(
+  ccl_pfam_p_g,
+  V(ccl_pfam_p_g)[ccl_pfam_p_g_spin_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_p_g_spin_top <- ccl_pfam_p_g_spin
+ccl_pfam_p_g_spin_top$names <-
+  ccl_pfam_p_g_spin_top$names[ccl_pfam_p_g_spin_top_v_msk]
+ccl_pfam_p_g_spin_top$membership <-
+  ccl_pfam_p_g_spin_top$membership[ccl_pfam_p_g_spin_top_v_msk]
+ccl_pfam_p_g_spin_top$vcount <- length(ccl_pfam_p_g_spin_top$names)
+
+# SpinGlass +/-Network
+# SpinGlass takes a long time to run (load cached if available)
+ccl_pfam_g_spin_file <- "data/ccl_pfam_g_spin.Rda"
+if (!file.exists(ccl_pfam_g_spin_file)) {
+  ccl_pfam_g_spin <- cluster_spinglass(ccl_pfam_g,
+                                       implementation = "neg")
+  save(ccl_pfam_g_spin, file = ccl_pfam_g_spin_file)
+} else {
+  load(ccl_pfam_g_spin_file)
+}
+ccl_pfam_g_spin_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_g_spin), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_g_spin_top_v_msk <- (
+  ccl_pfam_g_spin$membership %in% ccl_pfam_g_spin_top_ids
+)
+ccl_pfam_g_spin_top_g <- induced_subgraph(
+  ccl_pfam_g,
+  V(ccl_pfam_g)[ccl_pfam_g_spin_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_g_spin_top <- ccl_pfam_g_spin
+ccl_pfam_g_spin_top$names <-
+  ccl_pfam_g_spin_top$names[ccl_pfam_g_spin_top_v_msk]
+ccl_pfam_g_spin_top$membership <-
+  ccl_pfam_g_spin_top$membership[ccl_pfam_g_spin_top_v_msk]
+ccl_pfam_g_spin_top$vcount <- length(ccl_pfam_g_spin_top$names)
+
+par(mfrow = c(3, 2), mar = c(1, 1, 3, 1))
+plot(
+  ccl_pfam_p_g_imap,
+  ccl_pfam_p_g,
+  layout = ccl_pfam_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM CCLasso +Network InfoMap Clusters"
+)
+plot(
+  ccl_pfam_p_g_imap_top,
+  ccl_pfam_p_g_imap_top_g,
+  col = membership(ccl_pfam_p_g_imap)[ccl_pfam_p_g_imap_top_v_msk],
+  layout = ccl_pfam_p_g_coord[ccl_pfam_p_g_imap_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(ccl_pfam_p_g_imap)),
+                        alpha = 1)[ccl_pfam_p_g_imap_top_ids],
+  mark.col = rainbow(length(communities(ccl_pfam_p_g_imap)),
+                     alpha = 0.3)[ccl_pfam_p_g_imap_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_p_g_spin,
+  ccl_pfam_p_g,
+  layout = ccl_pfam_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM CCLasso +Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_p_g_spin_top,
+  ccl_pfam_p_g_spin_top_g,
+  col = membership(ccl_pfam_p_g_spin)[ccl_pfam_p_g_spin_top_v_msk],
+  layout = ccl_pfam_p_g_coord[ccl_pfam_p_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(ccl_pfam_p_g_spin)),
+                        alpha = 1)[ccl_pfam_p_g_spin_top_ids],
+  mark.col = rainbow(length(communities(ccl_pfam_p_g_spin)),
+                     alpha = 0.3)[ccl_pfam_p_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_g_spin,
+  ccl_pfam_g,
+  layout = ccl_pfam_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM CCLasso +/-Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_g_spin_top,
+  ccl_pfam_g_spin_top_g,
+  col = membership(ccl_pfam_g_spin)[ccl_pfam_g_spin_top_v_msk],
+  layout = ccl_pfam_g_coord[ccl_pfam_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(ccl_pfam_g_spin)),
+                        alpha = 1)[ccl_pfam_g_spin_top_ids],
+  mark.col = rainbow(length(communities(ccl_pfam_g_spin)),
+                     alpha = 0.3)[ccl_pfam_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+```
+
+```{r, include = FALSE}
+png(
+  "results/Pfam_CCLassoNet_Clusters.png",
+  height = 13.5,
+  width = 10,
+  units = "in",
+  res = 300
+)
+par(mfrow = c(3, 2), mar = c(1, 1, 3, 1))
+plot(
+  ccl_pfam_p_g_imap,
+  ccl_pfam_p_g,
+  layout = ccl_pfam_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM CCLasso +Network InfoMap Clusters"
+)
+plot(
+  ccl_pfam_p_g_imap_top,
+  ccl_pfam_p_g_imap_top_g,
+  col = membership(ccl_pfam_p_g_imap)[ccl_pfam_p_g_imap_top_v_msk],
+  layout = ccl_pfam_p_g_coord[ccl_pfam_p_g_imap_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(ccl_pfam_p_g_imap)),
+                        alpha = 1)[ccl_pfam_p_g_imap_top_ids],
+  mark.col = rainbow(length(communities(ccl_pfam_p_g_imap)),
+                     alpha = 0.3)[ccl_pfam_p_g_imap_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_p_g_spin,
+  ccl_pfam_p_g,
+  layout = ccl_pfam_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM CCLasso +Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_p_g_spin_top,
+  ccl_pfam_p_g_spin_top_g,
+  col = membership(ccl_pfam_p_g_spin)[ccl_pfam_p_g_spin_top_v_msk],
+  layout = ccl_pfam_p_g_coord[ccl_pfam_p_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(ccl_pfam_p_g_spin)),
+                        alpha = 1)[ccl_pfam_p_g_spin_top_ids],
+  mark.col = rainbow(length(communities(ccl_pfam_p_g_spin)),
+                     alpha = 0.3)[ccl_pfam_p_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_g_spin,
+  ccl_pfam_g,
+  layout = ccl_pfam_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM CCLasso +/-Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_g_spin_top,
+  ccl_pfam_g_spin_top_g,
+  col = membership(ccl_pfam_g_spin)[ccl_pfam_g_spin_top_v_msk],
+  layout = ccl_pfam_g_coord[ccl_pfam_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(ccl_pfam_g_spin)),
+                        alpha = 1)[ccl_pfam_g_spin_top_ids],
+  mark.col = rainbow(length(communities(ccl_pfam_g_spin)),
+                     alpha = 0.3)[ccl_pfam_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+invisible(dev.off())
+```
+
+#### Save cluster results:
+
+```{r}
+ccl_pfam_p_g_imap_data <- data.frame()
+for (i in 1:max(ccl_pfam_p_g_imap$membership)) {
+  ccl_pfam_p_g_imap_data <- rbind(
+    ccl_pfam_p_g_imap_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_p_g)$name[
+        ccl_pfam_p_g_imap$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_p_g_imap_data <-
+  merge.easy(ccl_pfam_p_g_imap_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_p_g_imap_data,
+          file = "results/Pfam_CCLassoPosNet_InfoMapClusters.csv",
+          row.names = FALSE)
+ccl_pfam_p_g_spin_data <- data.frame()
+for (i in 1:max(ccl_pfam_p_g_spin$membership)) {
+  ccl_pfam_p_g_spin_data <- rbind(
+    ccl_pfam_p_g_spin_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_p_g)$name[
+        ccl_pfam_p_g_spin$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_p_g_spin_data <-
+  merge.easy(ccl_pfam_p_g_spin_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_p_g_spin_data,
+          file = "results/Pfam_CCLassoPosNet_SpinGlassClusters.csv",
+          row.names = FALSE)
+ccl_pfam_g_spin_data <- data.frame()
+for (i in 1:max(ccl_pfam_g_spin$membership)) {
+  ccl_pfam_g_spin_data <- rbind(
+    ccl_pfam_g_spin_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_g)$name[
+        ccl_pfam_g_spin$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_g_spin_data <-
+  merge.easy(ccl_pfam_g_spin_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_g_spin_data,
+          file = "results/Pfam_CCLassoNet_SpinGlassClusters.csv",
+          row.names = FALSE)
+```
+
+### Build Network Including Patient Response
+
+```{r}
+# Add patient response to dataset
+pfam_resp_data <- pfam_data
+pfam_resp_data$Sample <- rownames(pfam_resp_data)
+pfam_resp_data <- merge.easy(pfam_resp_data, patient_meta, key = "Sample")
+rownames(pfam_resp_data) <- pfam_resp_data$Sample
+pfam_resp_data$Sample <- NULL
+
+# CCLasso takes many hours to run (load cached if available)
+ccl_pfam_resp_file <- "data/ccl_pfam_resp_cv200.Rda"
+if (!file.exists(ccl_pfam_resp_file)) {
+  ccl_pfam_resp <- cclasso(as.matrix(pfam_resp_data), counts = TRUE)
+  save(ccl_pfam_resp, file = ccl_pfam_resp_file)
+} else {
+  load(ccl_pfam_resp_file)
+}
+ccl_pfam_resp$cor_w[is.nan(ccl_pfam_resp$cor_w)] <- 0
+ccl_pfam_resp_pvals_vec <- ccl_pfam_resp$p_vals[upper.tri(ccl_pfam_resp$p_vals)]
+ccl_pfam_resp_pvals_adj <- p.adjust(ccl_pfam_resp_pvals_vec, "BH")
+ccl_pfam_resp_edges <- ccl_pfam_resp$cor_w[upper.tri(ccl_pfam_resp$cor_w)]
+# p-value < 1e-4 otherwise CCLasso network number of edges is very large
+ccl_pfam_resp_edges[ccl_pfam_resp_pvals_adj > 1e-4] <- 0
+ccl_pfam_resp_amat <- matrix(0, dim(pfam_resp_data)[2], dim(pfam_resp_data)[2])
+rownames(ccl_pfam_resp_amat) <- colnames(pfam_resp_data)
+colnames(ccl_pfam_resp_amat) <- colnames(pfam_resp_data)
+ccl_pfam_resp_amat[upper.tri(ccl_pfam_resp_amat)] <- ccl_pfam_resp_edges
+ccl_pfam_resp_g <- graph_from_adjacency_matrix(
+  ccl_pfam_resp_amat,
+  mode = "upper",
+  weighted = TRUE,
+  diag = FALSE
+)
+ccl_pfam_resp_g <- induced_subgraph(
+  ccl_pfam_resp_g,
+  V(ccl_pfam_resp_g)[
+    components(ccl_pfam_resp_g)$membership ==
+    which.max(components(ccl_pfam_resp_g)$csize)
+  ]
+)
+ccl_pfam_resp_p_g <- delete_edges(
+  ccl_pfam_resp_g,
+  E(ccl_pfam_resp_g)[E(ccl_pfam_resp_g)$weight < 0]
+)
+ccl_pfam_resp_p_g <- induced_subgraph(
+  ccl_pfam_resp_p_g,
+  V(ccl_pfam_resp_p_g)[
+    components(ccl_pfam_resp_p_g)$membership ==
+    which.max(components(ccl_pfam_resp_p_g)$csize)
+  ]
+)
+ccl_pfam_resp_p_g_v_msk <- (
+  V(ccl_pfam_resp_g)$name %in% V(ccl_pfam_resp_p_g)$name
+)
+ccl_pfam_resp_n_g <- delete_edges(
+  ccl_pfam_resp_g,
+  E(ccl_pfam_resp_g)[E(ccl_pfam_resp_g)$weight > 0]
+)
+ccl_pfam_resp_n_g <- induced_subgraph(
+  ccl_pfam_resp_n_g,
+  V(ccl_pfam_resp_n_g)[
+    components(ccl_pfam_resp_n_g)$membership ==
+    which.max(components(ccl_pfam_resp_n_g)$csize)
+  ]
+)
+ccl_pfam_resp_n_g_v_msk <- (
+  V(ccl_pfam_resp_g)$name %in% V(ccl_pfam_resp_n_g)$name
+)
+ccl_pfam_resp_g_coord <- layout_with_lgl(ccl_pfam_resp_g)
+ccl_pfam_resp_p_g_coord <-
+  ccl_pfam_resp_g_coord[ccl_pfam_resp_p_g_v_msk, , drop = F]
+ccl_pfam_resp_n_g_coord <-
+  ccl_pfam_resp_g_coord[ccl_pfam_resp_n_g_v_msk, , drop = F]
+```
+
+#### Where does response cluster?
+
+```{r, fig.height=9, fig.width=10}
+ccl_pfam_resp_p_g_imap <- cluster_infomap(ccl_pfam_resp_p_g)
+# SpinGlass takes a long time to run (load cached if available)
+ccl_pfam_resp_p_g_spin_file <- "data/ccl_pfam_resp_p_g_spin.Rda"
+if (!file.exists(ccl_pfam_resp_p_g_spin_file)) {
+  ccl_pfam_resp_p_g_spin <- cluster_spinglass(ccl_pfam_resp_p_g)
+  save(ccl_pfam_resp_p_g_spin, file = ccl_pfam_resp_p_g_spin_file)
+} else {
+  load(ccl_pfam_resp_p_g_spin_file)
+}
+# SpinGlass takes a long time to run (load cached if available)
+ccl_pfam_resp_g_spin_file <- "data/ccl_pfam_resp_g_spin.Rda"
+if (!file.exists(ccl_pfam_resp_g_spin_file)) {
+  ccl_pfam_resp_g_spin <- cluster_spinglass(ccl_pfam_resp_g,
+                                            implementation = "neg")
+  save(ccl_pfam_resp_g_spin, file = ccl_pfam_resp_g_spin_file)
+} else {
+  load(ccl_pfam_resp_g_spin_file)
+}
+ccl_pfam_resp_p_g_imap_data <- data.frame()
+for (i in 1:max(ccl_pfam_resp_p_g_imap$membership)) {
+  ccl_pfam_resp_p_g_imap_data <- rbind(
+    ccl_pfam_resp_p_g_imap_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_resp_p_g)$name[
+        ccl_pfam_resp_p_g_imap$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_resp_p_g_imap_data <-
+  merge.easy(ccl_pfam_resp_p_g_imap_data, pfam_feat, key = "Accession")
+ccl_pfam_resp_p_g_spin_data <- data.frame()
+for (i in 1:max(ccl_pfam_resp_p_g_spin$membership)) {
+  ccl_pfam_resp_p_g_spin_data <- rbind(
+    ccl_pfam_resp_p_g_spin_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_resp_p_g)$name[
+        ccl_pfam_resp_p_g_spin$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_resp_p_g_spin_data <-
+  merge.easy(ccl_pfam_resp_p_g_spin_data, pfam_feat, key = "Accession")
+ccl_pfam_resp_g_spin_data <- data.frame()
+for (i in 1:max(ccl_pfam_resp_g_spin$membership)) {
+  ccl_pfam_resp_g_spin_data <- rbind(
+    ccl_pfam_resp_g_spin_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_resp_g)$name[
+        ccl_pfam_resp_g_spin$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_resp_g_spin_data <-
+  merge.easy(ccl_pfam_resp_g_spin_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_resp_p_g_imap_data,
+          file = "results/PfamRes_CCLassoPosNet_InfoMapClusters.csv",
+          row.names = FALSE)
+write.csv(ccl_pfam_resp_p_g_spin_data,
+          file = "results/PfamRes_CCLassoPosNet_SpinGlassClusters.csv",
+          row.names = FALSE)
+write.csv(ccl_pfam_resp_g_spin_data,
+          file = "results/PfamRes_CCLassoNet_SpinGlassClusters.csv",
+          row.names = FALSE)
+cat(
+  "InfoMap +Network response cluster:",
+  ccl_pfam_resp_p_g_imap_data$Cluster[
+    ccl_pfam_resp_p_g_imap_data$Accession == "ResponseBinary"
+  ],
+  "\nSpinGlass +Network response cluster:",
+  ccl_pfam_resp_p_g_spin_data$Cluster[
+    ccl_pfam_resp_p_g_spin_data$Accession == "ResponseBinary"
+  ],
+  "\nSpinGlass +/-Network response cluster:",
+  ccl_pfam_resp_g_spin_data$Cluster[
+    ccl_pfam_resp_g_spin_data$Accession == "ResponseBinary"
+  ],
+  "\n"
+)
+```
+
+### Bipartite Graphs of InfoMap and SpinGlass Clusters Effect on Response
+
+```{r, fig.height=4.5, fig.width=10}
+ccl_pfam_p_g_imap_clusts <- data.frame(
+  Node = V(ccl_pfam_p_g)$name,
+  Cluster = ccl_pfam_p_g_imap$membership,
+  stringsAsFactors = FALSE
+)
+ccl_pfam_p_g_spin_clusts <- data.frame(
+  Node = V(ccl_pfam_p_g)$name,
+  Cluster = ccl_pfam_p_g_spin$membership,
+  stringsAsFactors = FALSE
+)
+ccl_pfam_g_spin_clusts <- data.frame(
+  Node = V(ccl_pfam_g)$name,
+  Cluster = ccl_pfam_g_spin$membership,
+  stringsAsFactors = FALSE
+)
+
+ccl_pfam_resp_g_edges <- cbind(as_edgelist(ccl_pfam_resp_g),
+                               E(ccl_pfam_resp_g)$weight)
+ccl_pfam_resp_g_resp_edges <-
+  as.data.frame(ccl_pfam_resp_g_edges[c(
+    ccl_pfam_resp_g_edges[, 1] == "ResponseBinary" |
+      ccl_pfam_resp_g_edges[, 2] == "ResponseBinary"
+  ), ], stringsAsFactors = FALSE)
+names(ccl_pfam_resp_g_resp_edges) <- c("Node", "Site", "Weight")
+
+ccl_pfam_resp_p_g_imap_clusts_resp_edges <-
+  merge.easy(ccl_pfam_resp_g_resp_edges,
+             ccl_pfam_p_g_imap_clusts,
+             key = "Node")
+ccl_pfam_resp_p_g_imap_clusts_resp_edges$Weight <-
+  as.numeric(ccl_pfam_resp_p_g_imap_clusts_resp_edges$Weight)
+ccl_pfam_resp_p_g_spin_clusts_resp_edges <-
+  merge.easy(ccl_pfam_resp_g_resp_edges,
+             ccl_pfam_p_g_spin_clusts,
+             key = "Node")
+ccl_pfam_resp_p_g_spin_clusts_resp_edges$Weight <-
+  as.numeric(ccl_pfam_resp_p_g_spin_clusts_resp_edges$Weight)
+ccl_pfam_resp_g_spin_clusts_resp_edges <-
+  merge.easy(ccl_pfam_resp_g_resp_edges,
+             ccl_pfam_g_spin_clusts,
+             key = "Node")
+ccl_pfam_resp_g_spin_clusts_resp_edges$Weight <-
+  as.numeric(ccl_pfam_resp_g_spin_clusts_resp_edges$Weight)
+
+ccl_pfam_resp_p_g_imap_clusts_resp_clusts <-
+  ccl_pfam_resp_p_g_imap_clusts_resp_edges %>%
+  group_by(Site, Cluster) %>%
+  summarise(Weight = mean(Weight)) %>%
+  subset(!is.na(Cluster))
+ccl_pfam_resp_p_g_spin_clusts_resp_clusts <-
+  ccl_pfam_resp_p_g_spin_clusts_resp_edges %>%
+  group_by(Site, Cluster) %>%
+  summarise(Weight = mean(Weight)) %>%
+  subset(!is.na(Cluster))
+ccl_pfam_resp_g_spin_clusts_resp_clusts <-
+  ccl_pfam_resp_g_spin_clusts_resp_edges %>%
+  group_by(Site, Cluster) %>%
+  summarise(Weight = mean(Weight)) %>%
+  subset(!is.na(Cluster))
+
+ccl_pfam_resp_p_g_imap_bipart_g <-
+  graph.data.frame(ccl_pfam_resp_p_g_imap_clusts_resp_clusts[, 1:2],
+                   directed = FALSE)
+V(ccl_pfam_resp_p_g_imap_bipart_g)$type <-
+  V(ccl_pfam_resp_p_g_imap_bipart_g)$name %in%
+  as.character(unlist(ccl_pfam_resp_p_g_imap_clusts_resp_clusts[, 1]))
+E(ccl_pfam_resp_p_g_imap_bipart_g)$weight <-
+  ccl_pfam_resp_p_g_imap_clusts_resp_clusts$Weight
+V(ccl_pfam_resp_p_g_imap_bipart_g)$color <-
+  V(ccl_pfam_resp_p_g_imap_bipart_g)$type
+V(ccl_pfam_resp_p_g_imap_bipart_g)$color <-
+  gsub("FALSE", rgb(0, 1, 1, 0.2),
+       V(ccl_pfam_resp_p_g_imap_bipart_g)$color)
+V(ccl_pfam_resp_p_g_imap_bipart_g)$color <-
+  gsub("TRUE", rgb(1, 1, 0, 0.2),
+       V(ccl_pfam_resp_p_g_imap_bipart_g)$color)
+
+ccl_pfam_resp_p_g_spin_bipart_g <-
+  graph.data.frame(ccl_pfam_resp_p_g_spin_clusts_resp_clusts[, 1:2],
+                   directed = FALSE)
+V(ccl_pfam_resp_p_g_spin_bipart_g)$type <-
+  V(ccl_pfam_resp_p_g_spin_bipart_g)$name %in%
+  as.character(unlist(ccl_pfam_resp_p_g_spin_clusts_resp_clusts[, 1]))
+E(ccl_pfam_resp_p_g_spin_bipart_g)$weight <-
+  ccl_pfam_resp_p_g_spin_clusts_resp_clusts$Weight
+V(ccl_pfam_resp_p_g_spin_bipart_g)$color <-
+  V(ccl_pfam_resp_p_g_spin_bipart_g)$type
+V(ccl_pfam_resp_p_g_spin_bipart_g)$color <-
+  gsub("FALSE", rgb(0, 1, 1, 0.2),
+       V(ccl_pfam_resp_p_g_spin_bipart_g)$color)
+V(ccl_pfam_resp_p_g_spin_bipart_g)$color <-
+  gsub("TRUE", rgb(1, 1, 0, 0.2),
+       V(ccl_pfam_resp_p_g_spin_bipart_g)$color)
+
+ccl_pfam_resp_g_spin_bipart_g <-
+  graph.data.frame(ccl_pfam_resp_g_spin_clusts_resp_clusts[, 1:2],
+                   directed = FALSE)
+V(ccl_pfam_resp_g_spin_bipart_g)$type <-
+  V(ccl_pfam_resp_g_spin_bipart_g)$name %in%
+  as.character(unlist(ccl_pfam_resp_g_spin_clusts_resp_clusts[, 1]))
+E(ccl_pfam_resp_g_spin_bipart_g)$weight <-
+  ccl_pfam_resp_g_spin_clusts_resp_clusts$Weight
+V(ccl_pfam_resp_g_spin_bipart_g)$color <-
+  V(ccl_pfam_resp_g_spin_bipart_g)$type
+V(ccl_pfam_resp_g_spin_bipart_g)$color <-
+  gsub("FALSE", rgb(0, 1, 1, 0.2),
+       V(ccl_pfam_resp_g_spin_bipart_g)$color)
+V(ccl_pfam_resp_g_spin_bipart_g)$color <-
+  gsub("TRUE", rgb(1, 1, 0, 0.2),
+       V(ccl_pfam_resp_g_spin_bipart_g)$color)
+
+par(mfrow = c(1, 3), mar = c(1, 1, 3, 1))
+plot(
+  ccl_pfam_resp_p_g_imap_bipart_g,
+  edge.color = ifelse(
+    E(ccl_pfam_resp_p_g_imap_bipart_g)$weight > 0,
+    rgb(0, 1, 0),
+    rgb(1, 0, 0)
+  ),
+  edge.width = abs(E(ccl_pfam_resp_p_g_imap_bipart_g)$weight) * 30,
+  layout = layout_as_bipartite,
+  vertex.size = 15,
+  vertex.label.cex = 1,
+  vertex.label.color = "black",
+  main = "PFAM Response CCLasso +Network\nInfoMap Cluster Effect on Response"
+)
+plot(
+  ccl_pfam_resp_p_g_spin_bipart_g,
+  edge.color = ifelse(
+    E(ccl_pfam_resp_p_g_spin_bipart_g)$weight > 0,
+    rgb(0, 1, 0),
+    rgb(1, 0, 0)
+  ),
+  edge.width = abs(E(ccl_pfam_resp_p_g_spin_bipart_g)$weight) * 30,
+  layout = layout_as_bipartite,
+  vertex.size = 15,
+  vertex.label.cex = 1,
+  vertex.label.color = "black",
+  main = "PFAM Response CCLasso +Network\nSpinGlass Cluster Effect on Response"
+)
+plot(
+  ccl_pfam_resp_g_spin_bipart_g,
+  edge.color = ifelse(
+    E(ccl_pfam_resp_g_spin_bipart_g)$weight > 0,
+    rgb(0, 1, 0),
+    rgb(1, 0, 0)
+  ),
+  edge.width = abs(E(ccl_pfam_resp_g_spin_bipart_g)$weight) * 30,
+  layout = layout_as_bipartite,
+  vertex.size = 15,
+  vertex.label.cex = 1,
+  vertex.label.color = "black",
+  main = "PFAM Response CCLasso +/-Network\nSpinGlass Cluster Effect on Response"
+)
+```
+
+```{r, include = FALSE}
+png(
+  "results/PfamRes_CCLassoNet_BipartiteClustering.png",
+  height = 4.5,
+  width = 10,
+  units = "in",
+  res = 300
+)
+par(mfrow = c(1, 3), mar = c(1, 1, 3, 1))
+plot(
+  ccl_pfam_resp_p_g_imap_bipart_g,
+  edge.color = ifelse(
+    E(ccl_pfam_resp_p_g_imap_bipart_g)$weight > 0,
+    rgb(0, 1, 0),
+    rgb(1, 0, 0)
+  ),
+  edge.width = abs(E(ccl_pfam_resp_p_g_imap_bipart_g)$weight) * 30,
+  layout = layout_as_bipartite,
+  vertex.size = 15,
+  vertex.label.cex = 1,
+  vertex.label.color = "black",
+  main = "PFAM Response CCLasso +Network\nInfoMap Cluster Effect on Response"
+)
+plot(
+  ccl_pfam_resp_p_g_spin_bipart_g,
+  edge.color = ifelse(
+    E(ccl_pfam_resp_p_g_spin_bipart_g)$weight > 0,
+    rgb(0, 1, 0),
+    rgb(1, 0, 0)
+  ),
+  edge.width = abs(E(ccl_pfam_resp_p_g_spin_bipart_g)$weight) * 30,
+  layout = layout_as_bipartite,
+  vertex.size = 15,
+  vertex.label.cex = 1,
+  vertex.label.color = "black",
+  main = "PFAM Response CCLasso +Network\nSpinGlass Cluster Effect on Response"
+)
+plot(
+  ccl_pfam_resp_g_spin_bipart_g,
+  edge.color = ifelse(
+    E(ccl_pfam_resp_g_spin_bipart_g)$weight > 0,
+    rgb(0, 1, 0),
+    rgb(1, 0, 0)
+  ),
+  edge.width = abs(E(ccl_pfam_resp_g_spin_bipart_g)$weight) * 30,
+  layout = layout_as_bipartite,
+  vertex.size = 15,
+  vertex.label.cex = 1,
+  vertex.label.color = "black",
+  main = "PFAM Response CCLasso +/-Network\nSpinGlass Cluster Effect on Response"
+)
+invisible(dev.off())
+```
+
+#### Save cluster bipartite results:
+
+```{r}
+pfam_feat_2 <- pfam_feat
+names(pfam_feat_2)[1] <- "Node"
+
+ccl_pfam_p_g_imap_clusts <-
+  merge.easy(ccl_pfam_p_g_imap_clusts, pfam_feat_2, key = "Node")
+ccl_pfam_resp_p_g_imap_clusts_resp_clust_weight <-
+  ccl_pfam_resp_p_g_imap_clusts_resp_clusts[, c("Cluster", "Weight")]
+names(ccl_pfam_resp_p_g_imap_clusts_resp_clust_weight)[2] <- "ResponseEffect"
+ccl_pfam_p_g_imap_clusts <-
+  merge.easy(
+    ccl_pfam_p_g_imap_clusts,
+    ccl_pfam_resp_p_g_imap_clusts_resp_clust_weight,
+    key = "Cluster"
+  )
+write.csv(
+  ccl_pfam_p_g_imap_clusts,
+  file = "results/Pfam_CCLassoPosNet_InfoMapClusters_ResponseEffect.csv",
+  row.names = FALSE
+)
+
+ccl_pfam_p_g_spin_clusts <-
+  merge.easy(ccl_pfam_p_g_spin_clusts, pfam_feat_2, key = "Node")
+ccl_pfam_resp_p_g_spin_clusts_resp_clust_weight <-
+  ccl_pfam_resp_p_g_spin_clusts_resp_clusts[, c("Cluster", "Weight")]
+names(ccl_pfam_resp_p_g_spin_clusts_resp_clust_weight)[2] <- "ResponseEffect"
+ccl_pfam_p_g_spin_clusts <-
+  merge.easy(
+    ccl_pfam_p_g_spin_clusts,
+    ccl_pfam_resp_p_g_spin_clusts_resp_clust_weight,
+    key = "Cluster"
+  )
+write.csv(
+  ccl_pfam_p_g_spin_clusts,
+  file = "results/Pfam_CCLassoPosNet_SpinGlassClusters_ResponseEffect.csv",
+  row.names = FALSE
+)
+
+ccl_pfam_g_spin_clusts <-
+  merge.easy(ccl_pfam_g_spin_clusts, pfam_feat_2, key = "Node")
+ccl_pfam_resp_g_spin_clusts_resp_clust_weight <-
+  ccl_pfam_resp_g_spin_clusts_resp_clusts[, c("Cluster", "Weight")]
+names(ccl_pfam_resp_g_spin_clusts_resp_clust_weight)[2] <- "ResponseEffect"
+ccl_pfam_g_spin_clusts <-
+  merge.easy(
+    ccl_pfam_g_spin_clusts,
+    ccl_pfam_resp_g_spin_clusts_resp_clust_weight,
+    key = "Cluster"
+  )
+write.csv(
+  ccl_pfam_g_spin_clusts,
+  file = "results/Pfam_CCLassoNet_SpinGlassClusters_ResponseEffect.csv",
+  row.names = FALSE
+)
+```
+
+### Build Responder and Non-Responder Networks
+
+```{r}
+# Responder
+pfam_rspdr_data <-
+  pfam_data[patient_meta$Sample[patient_meta$ResponseBinary == 1], ]
+
+# CCLasso takes many hours to run (load cached if available)
+ccl_pfam_rspdr_file <- "data/ccl_pfam_rspdr_cv200.Rda"
+if (!file.exists(ccl_pfam_rspdr_file)) {
+  ccl_pfam_rspdr <- cclasso(as.matrix(pfam_rspdr_data), counts = TRUE)
+  save(ccl_pfam_rspdr, file = ccl_pfam_rspdr_file)
+} else {
+  load(ccl_pfam_rspdr_file)
+}
+ccl_pfam_rspdr$cor_w[is.nan(ccl_pfam_rspdr$cor_w)] <- 0
+ccl_pfam_rspdr_pvals_vec <-
+  ccl_pfam_rspdr$p_vals[upper.tri(ccl_pfam_rspdr$p_vals)]
+ccl_pfam_rspdr_pvals_adj <-
+  p.adjust(ccl_pfam_rspdr_pvals_vec, "BH")
+ccl_pfam_rspdr_edges <-
+  ccl_pfam_rspdr$cor_w[upper.tri(ccl_pfam_rspdr$cor_w)]
+# p-value < 1e-4 otherwise CCLasso network number of edges is very large
+ccl_pfam_rspdr_edges[ccl_pfam_rspdr_pvals_adj > 1e-4] <- 0
+ccl_pfam_rspdr_amat <-
+  matrix(0, dim(pfam_rspdr_data)[2], dim(pfam_rspdr_data)[2])
+rownames(ccl_pfam_rspdr_amat) <- colnames(pfam_rspdr_data)
+colnames(ccl_pfam_rspdr_amat) <- colnames(pfam_rspdr_data)
+ccl_pfam_rspdr_amat[upper.tri(ccl_pfam_rspdr_amat)] <- ccl_pfam_rspdr_edges
+ccl_pfam_rspdr_g <- graph_from_adjacency_matrix(
+  ccl_pfam_rspdr_amat,
+  mode = "upper",
+  weighted = TRUE,
+  diag = FALSE
+)
+ccl_pfam_rspdr_g <- induced_subgraph(
+  ccl_pfam_rspdr_g,
+  V(ccl_pfam_rspdr_g)[
+    components(ccl_pfam_rspdr_g)$membership ==
+    which.max(components(ccl_pfam_rspdr_g)$csize)
+  ]
+)
+ccl_pfam_rspdr_g_v_msk <- (
+  V(ccl_pfam_rspdr_g)$name %in% V(ccl_pfam_rspdr_g)$name
+)
+ccl_pfam_rspdr_p_g <- delete_edges(
+  ccl_pfam_rspdr_g,
+  E(ccl_pfam_rspdr_g)[E(ccl_pfam_rspdr_g)$weight < 0]
+)
+ccl_pfam_rspdr_p_g <- induced_subgraph(
+  ccl_pfam_rspdr_p_g,
+  V(ccl_pfam_rspdr_p_g)[
+    components(ccl_pfam_rspdr_p_g)$membership ==
+    which.max(components(ccl_pfam_rspdr_p_g)$csize)
+  ]
+)
+ccl_pfam_rspdr_p_g_v_msk <- (
+  V(ccl_pfam_rspdr_g)$name %in% V(ccl_pfam_rspdr_p_g)$name
+)
+ccl_pfam_rspdr_n_g <- delete_edges(
+  ccl_pfam_rspdr_g,
+  E(ccl_pfam_rspdr_g)[E(ccl_pfam_rspdr_g)$weight > 0]
+)
+ccl_pfam_rspdr_n_g <- induced_subgraph(
+  ccl_pfam_rspdr_n_g,
+  V(ccl_pfam_rspdr_n_g)[
+    components(ccl_pfam_rspdr_n_g)$membership ==
+    which.max(components(ccl_pfam_rspdr_n_g)$csize)
+  ]
+)
+ccl_pfam_rspdr_n_g_v_msk <- (
+  V(ccl_pfam_rspdr_g)$name %in% V(ccl_pfam_rspdr_n_g)$name
+)
+
+# Non-Responder
+pfam_nspdr_data <-
+  pfam_data[patient_meta$Sample[patient_meta$ResponseBinary == 0], ]
+
+# CCLasso takes many hours to run (load cached if available)
+ccl_pfam_nspdr_file <- "data/ccl_pfam_nspdr_cv200.Rda"
+if (!file.exists(ccl_pfam_nspdr_file)) {
+  ccl_pfam_nspdr <- cclasso(as.matrix(pfam_nspdr_data), counts = TRUE)
+  save(ccl_pfam_nspdr, file = ccl_pfam_nspdr_file)
+} else {
+  load(ccl_pfam_nspdr_file)
+}
+ccl_pfam_nspdr$cor_w[is.nan(ccl_pfam_nspdr$cor_w)] <- 0
+ccl_pfam_nspdr_pvals_vec <-
+  ccl_pfam_nspdr$p_vals[upper.tri(ccl_pfam_nspdr$p_vals)]
+ccl_pfam_nspdr_pvals_adj <-
+  p.adjust(ccl_pfam_nspdr_pvals_vec, "BH")
+ccl_pfam_nspdr_edges <-
+  ccl_pfam_nspdr$cor_w[upper.tri(ccl_pfam_nspdr$cor_w)]
+# p-value < 1e-4 otherwise CCLasso network number of edges is very large
+ccl_pfam_nspdr_edges[ccl_pfam_nspdr_pvals_adj > 1e-4] <- 0
+ccl_pfam_nspdr_amat <-
+  matrix(0, dim(pfam_nspdr_data)[2], dim(pfam_nspdr_data)[2])
+rownames(ccl_pfam_nspdr_amat) <- colnames(pfam_nspdr_data)
+colnames(ccl_pfam_nspdr_amat) <- colnames(pfam_nspdr_data)
+ccl_pfam_nspdr_amat[upper.tri(ccl_pfam_nspdr_amat)] <- ccl_pfam_nspdr_edges
+ccl_pfam_nspdr_g <- graph_from_adjacency_matrix(
+  ccl_pfam_nspdr_amat,
+  mode = "upper",
+  weighted = TRUE,
+  diag = FALSE
+)
+ccl_pfam_nspdr_g <- induced_subgraph(
+  ccl_pfam_nspdr_g,
+  V(ccl_pfam_nspdr_g)[
+    components(ccl_pfam_nspdr_g)$membership ==
+    which.max(components(ccl_pfam_nspdr_g)$csize)
+  ]
+)
+ccl_pfam_nspdr_g_v_msk <- (
+  V(ccl_pfam_nspdr_g)$name %in% V(ccl_pfam_nspdr_g)$name
+)
+ccl_pfam_nspdr_p_g <- delete_edges(
+  ccl_pfam_nspdr_g,
+  E(ccl_pfam_nspdr_g)[E(ccl_pfam_nspdr_g)$weight < 0]
+)
+ccl_pfam_nspdr_p_g <- induced_subgraph(
+  ccl_pfam_nspdr_p_g,
+  V(ccl_pfam_nspdr_p_g)[
+    components(ccl_pfam_nspdr_p_g)$membership ==
+    which.max(components(ccl_pfam_nspdr_p_g)$csize)
+  ]
+)
+ccl_pfam_nspdr_p_g_v_msk <- (
+  V(ccl_pfam_nspdr_g)$name %in% V(ccl_pfam_nspdr_p_g)$name
+)
+ccl_pfam_nspdr_n_g <- delete_edges(
+  ccl_pfam_nspdr_g,
+  E(ccl_pfam_nspdr_g)[E(ccl_pfam_nspdr_g)$weight > 0]
+)
+ccl_pfam_nspdr_n_g <- induced_subgraph(
+  ccl_pfam_nspdr_n_g,
+  V(ccl_pfam_nspdr_n_g)[
+    components(ccl_pfam_nspdr_n_g)$membership ==
+    which.max(components(ccl_pfam_nspdr_n_g)$csize)
+  ]
+)
+ccl_pfam_nspdr_n_g_v_msk <- (
+  V(ccl_pfam_nspdr_g)$name %in% V(ccl_pfam_nspdr_n_g)$name
+)
+```
+
+### Visualize Networks
+
+```{r, fig.height=9, fig.width=10}
+ccl_pfam_rspdr_g_coord <- layout_with_lgl(ccl_pfam_rspdr_g)
+ccl_pfam_rspdr_p_g_coord <-
+  ccl_pfam_rspdr_g_coord[ccl_pfam_rspdr_p_g_v_msk, , drop = F]
+ccl_pfam_rspdr_n_g_coord <-
+  ccl_pfam_rspdr_g_coord[ccl_pfam_rspdr_n_g_v_msk, , drop = F]
+ccl_pfam_nspdr_g_coord <- layout_with_lgl(ccl_pfam_nspdr_g)
+ccl_pfam_nspdr_p_g_coord <-
+  ccl_pfam_nspdr_g_coord[ccl_pfam_nspdr_p_g_v_msk, , drop = F]
+ccl_pfam_nspdr_n_g_coord <-
+  ccl_pfam_nspdr_g_coord[ccl_pfam_nspdr_n_g_v_msk, , drop = F]
+par(mfrow = c(2, 3), mar = c(1, 1, 3, 1))
+plot_network(ccl_pfam_rspdr_g,
+             coord = ccl_pfam_rspdr_g_coord,
+             main = "PFAM Responder CCLasso Network")
+plot_network(ccl_pfam_rspdr_p_g,
+             coord = ccl_pfam_rspdr_p_g_coord,
+             main = "+ Interactions")
+plot_network(ccl_pfam_rspdr_n_g,
+             coord = ccl_pfam_rspdr_n_g_coord,
+             main = "- Interactions")
+plot_network(ccl_pfam_nspdr_g,
+             coord = ccl_pfam_nspdr_g_coord,
+             main = "PFAM Non-Responder CCLasso Network")
+plot_network(ccl_pfam_nspdr_p_g,
+             coord = ccl_pfam_nspdr_p_g_coord,
+             main = "+ Interactions")
+plot_network(ccl_pfam_nspdr_n_g,
+             coord = ccl_pfam_nspdr_n_g_coord,
+             main = "- Interactions")
+```
+
+```{r, include = FALSE}
+png(
+  "results/PfamRnR_CCLassoNet.png",
+  height = 9,
+  width = 10,
+  units = "in",
+  res = 300
+)
+par(mfrow = c(2, 3), mar = c(1, 1, 3, 1))
+plot_network(ccl_pfam_rspdr_g,
+             coord = ccl_pfam_rspdr_g_coord,
+             main = "PFAM Responder CCLasso Network")
+plot_network(ccl_pfam_rspdr_p_g,
+             coord = ccl_pfam_rspdr_p_g_coord,
+             main = "+ Interactions")
+plot_network(ccl_pfam_rspdr_n_g,
+             coord = ccl_pfam_rspdr_n_g_coord,
+             main = "- Interactions")
+plot_network(ccl_pfam_nspdr_g,
+             coord = ccl_pfam_nspdr_g_coord,
+             main = "PFAM Non-Responder CCLasso Network")
+plot_network(ccl_pfam_nspdr_p_g,
+             coord = ccl_pfam_nspdr_p_g_coord,
+             main = "+ Interactions")
+plot_network(ccl_pfam_nspdr_n_g,
+             coord = ccl_pfam_nspdr_n_g_coord,
+             main = "- Interactions")
+invisible(dev.off())
+```
+
+### Network Statistics
+
+#### Degree distribution, shortest paths distance distribution, transitivity:
+
+```{r, fig.height=18, fig.width=10}
+par(mfrow = c(4, 2), mar = c(5.1, 4.1, 4.1, 2.1))
+# degree distribution
+k_r <- degree(ccl_pfam_rspdr_g)
+hist(k_r,
+     breaks = 100,
+     xlab = "k",
+     ylab = "Frequency",
+     main = "R Degree Frequency")
+k_n <- degree(ccl_pfam_nspdr_g)
+hist(k_n,
+     breaks = 100,
+     xlab = "k",
+     ylab = NA,
+     main = "NR Degree Frequency")
+dd_r <- degree_distribution(ccl_pfam_rspdr_g)
+dd_r_nzero_pos <- which(dd_r != 0)
+pk_r <- dd_r[dd_r_nzero_pos]
+dx_r <- 1:max(k_r)
+dx_r <- dx_r[dd_r_nzero_pos]
+plot(
+  pk_r ~ log(dx_r),
+  log = "xy",
+  xlab = "log k",
+  ylab = "log Pk",
+  main = "R Log-Log Degree Distribution"
+)
+dd_n <- degree_distribution(ccl_pfam_nspdr_g)
+dd_n_nzero_pos <- which(dd_n != 0)
+pk_n <- dd_n[dd_n_nzero_pos]
+dx_n <- 1:max(k_n)
+dx_n <- dx_n[dd_n_nzero_pos]
+plot(
+  pk_n ~ log(dx_n),
+  log = "xy",
+  xlab = "log k",
+  ylab = NA,
+  main = "NR Log-Log Degree Distribution"
+)
+# distance distribution of shortest paths
+nv_r <- vcount(ccl_pfam_rspdr_g)
+bfs_r_vec <- matrix(nrow = nv_r, ncol = nv_r)
+for (i in 1:nv_r) {
+  bfs_r_vec[i, ] <- bfs(
+    ccl_pfam_rspdr_g,
+    root = i,
+    dist = TRUE,
+    unreachable = FALSE
+  )$dist
+}
+distd_r <- table(bfs_r_vec) / sum(bfs_r_vec, na.rm = TRUE)
+distd_r <- tail(distd_r, length(distd_r) - 1)
+plot(
+  names(distd_r),
+  distd_r,
+  xlab = "Distance",
+  ylab = expression(P[Distance]),
+  main = "R Distance Distribution of Shortest Paths"
+)
+nv_n <- vcount(ccl_pfam_nspdr_g)
+bfs_n_vec <- matrix(nrow = nv_n, ncol = nv_n)
+for (i in 1:nv_n) {
+  bfs_n_vec[i, ] <- bfs(
+    ccl_pfam_nspdr_g,
+    root = i,
+    dist = TRUE,
+    unreachable = FALSE
+  )$dist
+}
+distd_n <- table(bfs_n_vec) / sum(bfs_n_vec, na.rm = TRUE)
+distd_n <- tail(distd_n, length(distd_n) - 1)
+plot(
+  names(distd_n),
+  distd_n,
+  xlab = "Distance",
+  ylab = NA,
+  main = "NR Distance Distribution of Shortest Paths"
+)
+# clustering
+cl_r <- transitivity(ccl_pfam_rspdr_g, type = "local")
+cl_r_df <- data.frame(clust = cl_r, degree = k_r) %>%
+  group_by(degree) %>%
+  summarize(mclust = mean(clust, na.rm = TRUE))
+plot(
+  mclust ~ degree,
+  data = cl_r_df,
+  xlab = "k",
+  ylab = "C(k)",
+  main = "R Clustering Coefficent"
+)
+cl_n <- transitivity(ccl_pfam_nspdr_g, type = "local")
+cl_n_df <- data.frame(clust = cl_n, degree = k_n) %>%
+  group_by(degree) %>%
+  summarize(mclust = mean(clust, na.rm = TRUE))
+plot(
+  mclust ~ degree,
+  data = cl_n_df,
+  xlab = "k",
+  ylab = NA,
+  main = "NR Clustering Coefficent"
+)
+```
+
+```{r, include = FALSE}
+png(
+  "results/PfamRnR_CCLassoNet_Stats.png",
+  height = 18,
+  width = 10,
+  units = "in",
+  res = 300
+)
+par(mfrow = c(4, 2), mar = c(5.1, 4.1, 4.1, 2.1))
+hist(k_r,
+     breaks = 100,
+     xlab = "k",
+     ylab = "Frequency",
+     main = "R Degree Frequency")
+hist(k_n,
+     breaks = 100,
+     xlab = "k",
+     ylab = NA,
+     main = "NR Degree Frequency")
+plot(
+  pk_r ~ log(dx_r),
+  log = "xy",
+  xlab = "log k",
+  ylab = "log Pk",
+  main = "R Log-Log Degree Dist"
+)
+plot(
+  pk_n ~ log(dx_n),
+  log = "xy",
+  xlab = "log k",
+  ylab = NA,
+  main = "NR Log-Log Degree Dist"
+)
+plot(
+  names(distd_r),
+  distd_r,
+  xlab = "Distance",
+  ylab = expression(P[Distance]),
+  main = "R Distance Distribution of Shortest Paths"
+)
+plot(
+  names(distd_n),
+  distd_n,
+  xlab = "Distance",
+  ylab = NA,
+  main = "NR Distance Distribution of Shortest Paths"
+)
+plot(
+  mclust ~ degree,
+  data = cl_r_df,
+  xlab = "k",
+  ylab = "C(k)",
+  main = "R Clustering Coefficent"
+)
+plot(
+  mclust ~ degree,
+  data = cl_n_df,
+  xlab = "k",
+  ylab = NA,
+  main = "NR Clustering Coefficent"
+)
+invisible(dev.off())
+```
+
+#### Additional statistics:
+
+**Note: could not calculate betweenness and closeness on networks since it appears
+networks are too large and it crashes the R session**
+
+```{r}
+data.frame(
+  "Clustering coef." = c(
+    transitivity(ccl_pfam_rspdr_g, type = "global"),
+    transitivity(ccl_pfam_nspdr_g, type = "global")
+  ),
+  "Power law coef." = c(
+    fit_power_law(k_r, xmin = 1)$alpha,
+    fit_power_law(k_n, xmin = 1)$alpha
+  ),
+  "Mean shortest path" = c(
+    mean(bfs_r_vec, na.rm = TRUE),
+    mean(bfs_n_vec, na.rm = TRUE)
+  ),
+  "Density" = c(
+    edge_density(ccl_pfam_rspdr_g),
+    edge_density(ccl_pfam_nspdr_g)
+  ),
+  row.names = c("Responders", "Non-Responders")
+)
+```
+
+### Community Detection in Responder/Non-Responder Networks Using InfoMap and SpinGlass
+
+```{r, fig.height=27, fig.width=10}
+num_top_clusts <- 3
+
+# Responder +Network InfoMap
+ccl_pfam_rspdr_p_g_imap <- cluster_infomap(ccl_pfam_rspdr_p_g)
+ccl_pfam_rspdr_p_g_imap_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_rspdr_p_g_imap), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_rspdr_p_g_imap_top_v_msk <- (
+  ccl_pfam_rspdr_p_g_imap$membership %in% ccl_pfam_rspdr_p_g_imap_top_ids
+)
+ccl_pfam_rspdr_p_g_imap_top_g <- induced_subgraph(
+  ccl_pfam_rspdr_p_g,
+  V(ccl_pfam_rspdr_p_g)[ccl_pfam_rspdr_p_g_imap_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_rspdr_p_g_imap_top <- ccl_pfam_rspdr_p_g_imap
+ccl_pfam_rspdr_p_g_imap_top$names <-
+  ccl_pfam_rspdr_p_g_imap_top$names[ccl_pfam_rspdr_p_g_imap_top_v_msk]
+ccl_pfam_rspdr_p_g_imap_top$membership <-
+  ccl_pfam_rspdr_p_g_imap_top$membership[ccl_pfam_rspdr_p_g_imap_top_v_msk]
+ccl_pfam_rspdr_p_g_imap_top$vcount <- length(ccl_pfam_rspdr_p_g_imap_top$names)
+
+# Responder +Network SpinGlass
+# SpinGlass takes a long time to run (load cached if available)
+ccl_pfam_rspdr_p_g_spin_file <- "data/ccl_pfam_rspdr_p_g_spin.Rda"
+if (!file.exists(ccl_pfam_rspdr_p_g_spin_file)) {
+  ccl_pfam_rspdr_p_g_spin <- cluster_spinglass(ccl_pfam_rspdr_p_g)
+  save(ccl_pfam_rspdr_p_g_spin, file = ccl_pfam_rspdr_p_g_spin_file)
+} else {
+  load(ccl_pfam_rspdr_p_g_spin_file)
+}
+ccl_pfam_rspdr_p_g_spin_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_rspdr_p_g_spin), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_rspdr_p_g_spin_top_v_msk <- (
+  ccl_pfam_rspdr_p_g_spin$membership %in% ccl_pfam_rspdr_p_g_spin_top_ids
+)
+ccl_pfam_rspdr_p_g_spin_top_g <- induced_subgraph(
+  ccl_pfam_rspdr_p_g,
+  V(ccl_pfam_rspdr_p_g)[ccl_pfam_rspdr_p_g_spin_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_rspdr_p_g_spin_top <- ccl_pfam_rspdr_p_g_spin
+ccl_pfam_rspdr_p_g_spin_top$names <-
+  ccl_pfam_rspdr_p_g_spin_top$names[ccl_pfam_rspdr_p_g_spin_top_v_msk]
+ccl_pfam_rspdr_p_g_spin_top$membership <-
+  ccl_pfam_rspdr_p_g_spin_top$membership[ccl_pfam_rspdr_p_g_spin_top_v_msk]
+ccl_pfam_rspdr_p_g_spin_top$vcount <- length(ccl_pfam_rspdr_p_g_spin_top$names)
+
+# Responder +/-Network SpinGlass
+# SpinGlass takes a long time to run (load cached if available)
+ccl_pfam_rspdr_g_spin_file <- "data/ccl_pfam_rspdr_g_spin.Rda"
+if (!file.exists(ccl_pfam_rspdr_g_spin_file)) {
+  ccl_pfam_rspdr_g_spin <- cluster_spinglass(ccl_pfam_rspdr_g,
+                                             implementation = "neg")
+  save(ccl_pfam_rspdr_g_spin, file = ccl_pfam_rspdr_g_spin_file)
+} else {
+  load(ccl_pfam_rspdr_g_spin_file)
+}
+ccl_pfam_rspdr_g_spin_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_rspdr_g_spin), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_rspdr_g_spin_top_v_msk <- (
+  ccl_pfam_rspdr_g_spin$membership %in% ccl_pfam_rspdr_g_spin_top_ids
+)
+ccl_pfam_rspdr_g_spin_top_g <- induced_subgraph(
+  ccl_pfam_rspdr_g,
+  V(ccl_pfam_rspdr_g)[ccl_pfam_rspdr_g_spin_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_rspdr_g_spin_top <- ccl_pfam_rspdr_g_spin
+ccl_pfam_rspdr_g_spin_top$names <-
+  ccl_pfam_rspdr_g_spin_top$names[ccl_pfam_rspdr_g_spin_top_v_msk]
+ccl_pfam_rspdr_g_spin_top$membership <-
+  ccl_pfam_rspdr_g_spin_top$membership[ccl_pfam_rspdr_g_spin_top_v_msk]
+ccl_pfam_rspdr_g_spin_top$vcount <- length(ccl_pfam_rspdr_g_spin_top$names)
+
+# Non-Responder +Network InfoMap
+ccl_pfam_nspdr_p_g_imap <- cluster_infomap(ccl_pfam_nspdr_p_g)
+ccl_pfam_nspdr_p_g_imap_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_nspdr_p_g_imap), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_nspdr_p_g_imap_top_v_msk <- (
+  ccl_pfam_nspdr_p_g_imap$membership %in% ccl_pfam_nspdr_p_g_imap_top_ids
+)
+ccl_pfam_nspdr_p_g_imap_top_g <- induced_subgraph(
+  ccl_pfam_nspdr_p_g,
+  V(ccl_pfam_nspdr_p_g)[ccl_pfam_nspdr_p_g_imap_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_nspdr_p_g_imap_top <- ccl_pfam_nspdr_p_g_imap
+ccl_pfam_nspdr_p_g_imap_top$names <-
+  ccl_pfam_nspdr_p_g_imap_top$names[ccl_pfam_nspdr_p_g_imap_top_v_msk]
+ccl_pfam_nspdr_p_g_imap_top$membership <-
+  ccl_pfam_nspdr_p_g_imap_top$membership[ccl_pfam_nspdr_p_g_imap_top_v_msk]
+ccl_pfam_nspdr_p_g_imap_top$vcount <- length(ccl_pfam_nspdr_p_g_imap_top$names)
+
+# Non-Responder +Network SpinGlass
+# SpinGlass takes a long time to run (load cached if available)
+ccl_pfam_nspdr_p_g_spin_file <- "data/ccl_pfam_nspdr_p_g_spin.Rda"
+if (!file.exists(ccl_pfam_nspdr_p_g_spin_file)) {
+  ccl_pfam_nspdr_p_g_spin <- cluster_spinglass(ccl_pfam_nspdr_p_g)
+  save(ccl_pfam_nspdr_p_g_spin, file = ccl_pfam_nspdr_p_g_spin_file)
+} else {
+  load(ccl_pfam_nspdr_p_g_spin_file)
+}
+ccl_pfam_nspdr_p_g_spin_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_nspdr_p_g_spin), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_nspdr_p_g_spin_top_v_msk <- (
+  ccl_pfam_nspdr_p_g_spin$membership %in% ccl_pfam_nspdr_p_g_spin_top_ids
+)
+ccl_pfam_nspdr_p_g_spin_top_g <- induced_subgraph(
+  ccl_pfam_nspdr_p_g,
+  V(ccl_pfam_nspdr_p_g)[ccl_pfam_nspdr_p_g_spin_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_nspdr_p_g_spin_top <- ccl_pfam_nspdr_p_g_spin
+ccl_pfam_nspdr_p_g_spin_top$names <-
+  ccl_pfam_nspdr_p_g_spin_top$names[ccl_pfam_nspdr_p_g_spin_top_v_msk]
+ccl_pfam_nspdr_p_g_spin_top$membership <-
+  ccl_pfam_nspdr_p_g_spin_top$membership[ccl_pfam_nspdr_p_g_spin_top_v_msk]
+ccl_pfam_nspdr_p_g_spin_top$vcount <- length(ccl_pfam_nspdr_p_g_spin_top$names)
+
+# Non-Responder +/-Network SpinGlass
+# SpinGlass takes a long time to run (load cached if available)
+ccl_pfam_nspdr_g_spin_file <- "data/ccl_pfam_nspdr_g_spin.Rda"
+if (!file.exists(ccl_pfam_nspdr_g_spin_file)) {
+  ccl_pfam_nspdr_g_spin <- cluster_spinglass(ccl_pfam_nspdr_g,
+                                             implementation = "neg")
+  save(ccl_pfam_nspdr_g_spin, file = ccl_pfam_nspdr_g_spin_file)
+} else {
+  load(ccl_pfam_nspdr_g_spin_file)
+}
+ccl_pfam_nspdr_g_spin_top_ids <- sort(as.numeric(names(
+  sort(sizes(ccl_pfam_nspdr_g_spin), decreasing = TRUE)[1:num_top_clusts]
+)))
+ccl_pfam_nspdr_g_spin_top_v_msk <- (
+  ccl_pfam_nspdr_g_spin$membership %in% ccl_pfam_nspdr_g_spin_top_ids
+)
+ccl_pfam_nspdr_g_spin_top_g <- induced_subgraph(
+  ccl_pfam_nspdr_g,
+  V(ccl_pfam_nspdr_g)[ccl_pfam_nspdr_g_spin_top_v_msk]
+)
+# iGraph has no functionality to subset community objects so hack it
+ccl_pfam_nspdr_g_spin_top <- ccl_pfam_nspdr_g_spin
+ccl_pfam_nspdr_g_spin_top$names <-
+  ccl_pfam_nspdr_g_spin_top$names[ccl_pfam_nspdr_g_spin_top_v_msk]
+ccl_pfam_nspdr_g_spin_top$membership <-
+  ccl_pfam_nspdr_g_spin_top$membership[ccl_pfam_nspdr_g_spin_top_v_msk]
+ccl_pfam_nspdr_g_spin_top$vcount <- length(ccl_pfam_nspdr_g_spin_top$names)
+
+par(mfrow = c(6, 2), mar = c(1, 1, 3, 1))
+plot(
+  ccl_pfam_rspdr_p_g_imap,
+  ccl_pfam_rspdr_p_g,
+  layout = ccl_pfam_rspdr_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Responder CCLasso +Network InfoMap Clusters"
+)
+plot(
+  ccl_pfam_rspdr_p_g_imap_top,
+  ccl_pfam_rspdr_p_g_imap_top_g,
+  col = membership(ccl_pfam_rspdr_p_g_imap)[ccl_pfam_rspdr_p_g_imap_top_v_msk],
+  layout = ccl_pfam_rspdr_p_g_coord[ccl_pfam_rspdr_p_g_imap_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_rspdr_p_g_imap
+  )), alpha = 1)[ccl_pfam_rspdr_p_g_imap_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_rspdr_p_g_imap
+  )), alpha = 0.3)[ccl_pfam_rspdr_p_g_imap_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_nspdr_p_g_imap,
+  ccl_pfam_nspdr_p_g,
+  layout = ccl_pfam_nspdr_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Non-Responder CCLasso +Network InfoMap Clusters"
+)
+plot(
+  ccl_pfam_nspdr_p_g_imap_top,
+  ccl_pfam_nspdr_p_g_imap_top_g,
+  col = membership(ccl_pfam_nspdr_p_g_imap)[ccl_pfam_nspdr_p_g_imap_top_v_msk],
+  layout = ccl_pfam_nspdr_p_g_coord[ccl_pfam_nspdr_p_g_imap_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_nspdr_p_g_imap
+  )), alpha = 1)[ccl_pfam_nspdr_p_g_imap_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_nspdr_p_g_imap
+  )), alpha = 0.3)[ccl_pfam_nspdr_p_g_imap_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_rspdr_p_g_spin,
+  ccl_pfam_rspdr_p_g,
+  layout = ccl_pfam_rspdr_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Responder CCLasso +Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_rspdr_p_g_spin_top,
+  ccl_pfam_rspdr_p_g_spin_top_g,
+  col = membership(ccl_pfam_rspdr_p_g_spin)[ccl_pfam_rspdr_p_g_spin_top_v_msk],
+  layout = ccl_pfam_rspdr_p_g_coord[ccl_pfam_rspdr_p_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_rspdr_p_g_spin
+  )),
+  alpha = 1)[ccl_pfam_rspdr_p_g_spin_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_rspdr_p_g_spin
+  )),
+  alpha = 0.3)[ccl_pfam_rspdr_p_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_nspdr_p_g_spin,
+  ccl_pfam_nspdr_p_g,
+  layout = ccl_pfam_nspdr_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Non-Responder CCLasso +Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_nspdr_p_g_spin_top,
+  ccl_pfam_nspdr_p_g_spin_top_g,
+  col = membership(ccl_pfam_nspdr_p_g_spin)[ccl_pfam_nspdr_p_g_spin_top_v_msk],
+  layout = ccl_pfam_nspdr_p_g_coord[ccl_pfam_nspdr_p_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_nspdr_p_g_spin
+  )),
+  alpha = 1)[ccl_pfam_nspdr_p_g_spin_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_nspdr_p_g_spin
+  )),
+  alpha = 0.3)[ccl_pfam_nspdr_p_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_rspdr_g_spin,
+  ccl_pfam_rspdr_g,
+  layout = ccl_pfam_rspdr_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Responder CCLasso +/-Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_rspdr_g_spin_top,
+  ccl_pfam_rspdr_g_spin_top_g,
+  col = membership(ccl_pfam_rspdr_g_spin)[ccl_pfam_rspdr_g_spin_top_v_msk],
+  layout = ccl_pfam_rspdr_g_coord[ccl_pfam_rspdr_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_rspdr_g_spin
+  )),
+  alpha = 1)[ccl_pfam_rspdr_g_spin_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_rspdr_g_spin
+  )),
+  alpha = 0.3)[ccl_pfam_rspdr_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_nspdr_g_spin,
+  ccl_pfam_nspdr_g,
+  layout = ccl_pfam_nspdr_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Non-Responder CCLasso +/-Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_nspdr_g_spin_top,
+  ccl_pfam_nspdr_g_spin_top_g,
+  col = membership(ccl_pfam_nspdr_g_spin)[ccl_pfam_nspdr_g_spin_top_v_msk],
+  layout = ccl_pfam_nspdr_g_coord[ccl_pfam_nspdr_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_nspdr_g_spin
+  )),
+  alpha = 1)[ccl_pfam_nspdr_g_spin_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_nspdr_g_spin
+  )),
+  alpha = 0.3)[ccl_pfam_nspdr_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+```
+
+```{r, include = FALSE}
+png(
+  "results/PfamRnR_CCLassoNet_Clusters.png",
+  height = 27,
+  width = 10,
+  units = "in",
+  res = 300
+)
+par(mfrow = c(6, 2), mar = c(1, 1, 3, 1))
+plot(
+  ccl_pfam_rspdr_p_g_imap,
+  ccl_pfam_rspdr_p_g,
+  layout = ccl_pfam_rspdr_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Responder CCLasso +Network InfoMap Clusters"
+)
+plot(
+  ccl_pfam_rspdr_p_g_imap_top,
+  ccl_pfam_rspdr_p_g_imap_top_g,
+  col = membership(ccl_pfam_rspdr_p_g_imap)[ccl_pfam_rspdr_p_g_imap_top_v_msk],
+  layout = ccl_pfam_rspdr_p_g_coord[ccl_pfam_rspdr_p_g_imap_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_rspdr_p_g_imap
+  )), alpha = 1)[ccl_pfam_rspdr_p_g_imap_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_rspdr_p_g_imap
+  )), alpha = 0.3)[ccl_pfam_rspdr_p_g_imap_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_nspdr_p_g_imap,
+  ccl_pfam_nspdr_p_g,
+  layout = ccl_pfam_nspdr_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Non-Responder CCLasso +Network InfoMap Clusters"
+)
+plot(
+  ccl_pfam_nspdr_p_g_imap_top,
+  ccl_pfam_nspdr_p_g_imap_top_g,
+  col = membership(ccl_pfam_nspdr_p_g_imap)[ccl_pfam_nspdr_p_g_imap_top_v_msk],
+  layout = ccl_pfam_nspdr_p_g_coord[ccl_pfam_nspdr_p_g_imap_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_nspdr_p_g_imap
+  )), alpha = 1)[ccl_pfam_nspdr_p_g_imap_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_nspdr_p_g_imap
+  )), alpha = 0.3)[ccl_pfam_nspdr_p_g_imap_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_rspdr_p_g_spin,
+  ccl_pfam_rspdr_p_g,
+  layout = ccl_pfam_rspdr_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Responder CCLasso +Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_rspdr_p_g_spin_top,
+  ccl_pfam_rspdr_p_g_spin_top_g,
+  col = membership(ccl_pfam_rspdr_p_g_spin)[ccl_pfam_rspdr_p_g_spin_top_v_msk],
+  layout = ccl_pfam_rspdr_p_g_coord[ccl_pfam_rspdr_p_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_rspdr_p_g_spin
+  )),
+  alpha = 1)[ccl_pfam_rspdr_p_g_spin_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_rspdr_p_g_spin
+  )),
+  alpha = 0.3)[ccl_pfam_rspdr_p_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_nspdr_p_g_spin,
+  ccl_pfam_nspdr_p_g,
+  layout = ccl_pfam_nspdr_p_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Non-Responder CCLasso +Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_nspdr_p_g_spin_top,
+  ccl_pfam_nspdr_p_g_spin_top_g,
+  col = membership(ccl_pfam_nspdr_p_g_spin)[ccl_pfam_nspdr_p_g_spin_top_v_msk],
+  layout = ccl_pfam_nspdr_p_g_coord[ccl_pfam_nspdr_p_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_nspdr_p_g_spin
+  )),
+  alpha = 1)[ccl_pfam_nspdr_p_g_spin_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_nspdr_p_g_spin
+  )),
+  alpha = 0.3)[ccl_pfam_nspdr_p_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_rspdr_g_spin,
+  ccl_pfam_rspdr_g,
+  layout = ccl_pfam_rspdr_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Responder CCLasso +/-Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_rspdr_g_spin_top,
+  ccl_pfam_rspdr_g_spin_top_g,
+  col = membership(ccl_pfam_rspdr_g_spin)[ccl_pfam_rspdr_g_spin_top_v_msk],
+  layout = ccl_pfam_rspdr_g_coord[ccl_pfam_rspdr_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_rspdr_g_spin
+  )),
+  alpha = 1)[ccl_pfam_rspdr_g_spin_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_rspdr_g_spin
+  )),
+  alpha = 0.3)[ccl_pfam_rspdr_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+plot(
+  ccl_pfam_nspdr_g_spin,
+  ccl_pfam_nspdr_g,
+  layout = ccl_pfam_nspdr_g_coord,
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = "PFAM Non-Responder CCLasso +/-Network SpinGlass Clusters"
+)
+plot(
+  ccl_pfam_nspdr_g_spin_top,
+  ccl_pfam_nspdr_g_spin_top_g,
+  col = membership(ccl_pfam_nspdr_g_spin)[ccl_pfam_nspdr_g_spin_top_v_msk],
+  layout = ccl_pfam_nspdr_g_coord[ccl_pfam_nspdr_g_spin_top_v_msk, , drop = F],
+  mark.border = rainbow(length(communities(
+    ccl_pfam_nspdr_g_spin
+  )),
+  alpha = 1)[ccl_pfam_nspdr_g_spin_top_ids],
+  mark.col = rainbow(length(communities(
+    ccl_pfam_nspdr_g_spin
+  )),
+  alpha = 0.3)[ccl_pfam_nspdr_g_spin_top_ids],
+  vertex.size = 4,
+  vertex.label.cex = 0.25,
+  main = paste("Top", num_top_clusts, "Clusters")
+)
+invisible(dev.off())
+```
+
+### Save cluster results:
+
+```{r}
+# Responder
+ccl_pfam_rspdr_p_g_imap_data <- data.frame()
+for (i in 1:max(ccl_pfam_rspdr_p_g_imap$membership)) {
+  ccl_pfam_rspdr_p_g_imap_data <- rbind(
+    ccl_pfam_rspdr_p_g_imap_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_rspdr_p_g)$name[
+        ccl_pfam_rspdr_p_g_imap$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_rspdr_p_g_imap_data <-
+  merge.easy(ccl_pfam_rspdr_p_g_imap_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_rspdr_p_g_imap_data,
+          file = "results/PfamRpr_CCLassoPosNet_InfoMapClusters.csv",
+          row.names = FALSE)
+ccl_pfam_rspdr_p_g_spin_data <- data.frame()
+for (i in 1:max(ccl_pfam_rspdr_p_g_spin$membership)) {
+  ccl_pfam_rspdr_p_g_spin_data <- rbind(
+    ccl_pfam_rspdr_p_g_spin_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_rspdr_p_g)$name[
+        ccl_pfam_rspdr_p_g_spin$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_rspdr_p_g_spin_data <-
+  merge.easy(ccl_pfam_rspdr_p_g_spin_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_rspdr_p_g_spin_data,
+          file = "results/PfamRpr_CCLassoPosNet_SpinGlassClusters.csv",
+          row.names = FALSE)
+ccl_pfam_rspdr_g_spin_data <- data.frame()
+for (i in 1:max(ccl_pfam_rspdr_g_spin$membership)) {
+  ccl_pfam_rspdr_g_spin_data <- rbind(
+    ccl_pfam_rspdr_g_spin_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_rspdr_g)$name[
+        ccl_pfam_rspdr_g_spin$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_rspdr_g_spin_data <-
+  merge.easy(ccl_pfam_rspdr_g_spin_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_rspdr_g_spin_data,
+          file = "results/PfamRpr_CCLassoNet_SpinGlassClusters.csv")
+
+# Non-Responder
+ccl_pfam_nspdr_p_g_imap_data <- data.frame()
+for (i in 1:max(ccl_pfam_nspdr_p_g_imap$membership)) {
+  ccl_pfam_nspdr_p_g_imap_data <- rbind(
+    ccl_pfam_nspdr_p_g_imap_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_nspdr_p_g)$name[
+        ccl_pfam_nspdr_p_g_imap$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_nspdr_p_g_imap_data <-
+  merge.easy(ccl_pfam_nspdr_p_g_imap_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_nspdr_p_g_imap_data,
+          file = "results/PfamNpr_CCLassoPosNet_InfoMapClusters.csv",
+          row.names = FALSE)
+ccl_pfam_nspdr_p_g_spin_data <- data.frame()
+for (i in 1:max(ccl_pfam_nspdr_p_g_spin$membership)) {
+  ccl_pfam_nspdr_p_g_spin_data <- rbind(
+    ccl_pfam_nspdr_p_g_spin_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_nspdr_p_g)$name[
+        ccl_pfam_nspdr_p_g_spin$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_nspdr_p_g_spin_data <-
+  merge.easy(ccl_pfam_nspdr_p_g_spin_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_nspdr_p_g_spin_data,
+          file = "results/PfamNpr_CCLassoPosNet_SpinGlassClusters.csv",
+          row.names = FALSE)
+ccl_pfam_nspdr_g_spin_data <- data.frame()
+for (i in 1:max(ccl_pfam_nspdr_g_spin$membership)) {
+  ccl_pfam_nspdr_g_spin_data <- rbind(
+    ccl_pfam_nspdr_g_spin_data,
+    data.frame(
+      Cluster = i,
+      Accession = V(ccl_pfam_nspdr_g)$name[
+        ccl_pfam_nspdr_g_spin$membership == i
+      ],
+      stringsAsFactors = FALSE
+    )
+  )
+}
+ccl_pfam_nspdr_g_spin_data <-
+  merge.easy(ccl_pfam_nspdr_g_spin_data, pfam_feat, key = "Accession")
+write.csv(ccl_pfam_nspdr_g_spin_data,
+          file = "results/PfamNpr_CCLassoNet_SpinGlassClusters.csv",
+          row.names = FALSE)
+```

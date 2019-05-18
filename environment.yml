@@ -1,0 +1,42 @@
+name: cancer-mbiome-ict-net
+channels:
+  - defaults
+  - conda-forge
+  - bioconda
+dependencies:
+  - gfortran_linux-64
+  - libgfortran
+  - readline
+  - r-base
+  - r-knitr
+  - r-rmarkdown
+  - r-argparse
+  - r-formatr
+  - r-catools
+  - r-bitops
+  - r-digest
+  - r-rcpp
+  - r-rcpparmadillo
+  - r-codetools
+  - r-readxl
+  - r-mclust
+  - r-desctools
+  - r-bindr
+  - r-deoptimr
+  - r-bindrcpp
+  - r-tidyselect
+  - r-tidyverse
+  - r-plogr
+  - r-network
+  - r-robustbase
+  - r-coda
+  - r-trust
+  - r-lpsolve
+  - r-statnet.common
+  - r-igraph
+  - r-huge
+  - r-ergm
+  - r-powerlaw
+  - r-data.table
+  - r-tinytex
+  - bioconductor-biobase
